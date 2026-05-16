@@ -1151,7 +1151,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				msg.Info.ID, mediaType, imageMimeType, filename, imageDownloadPath,
 			)
 		} else {
-			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent)
+			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, msg.Info.ID)
 		}
 	}
 

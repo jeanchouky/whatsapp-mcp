@@ -919,6 +919,37 @@ func TestHandleMessage_ImageWithCaption_WebhookForwarded(t *testing.T) {
 	}
 }
 
+// TestHandleMessage_TextOnly_WebhookIncludesMessageID is the regression test for
+// the bug where the text-only webhook path dropped messageId: downstream routers
+// dedup on message_id and need a stable identifier for every message, not just media.
+func TestHandleMessage_TextOnly_WebhookIncludesMessageID(t *testing.T) {
+	srv, webhookCh := captureWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	msg := buildTextMessage(phonePN, phonePN, types.EmptyJID, types.EmptyJID, false, "hello router")
+
+	handleMessage(client, ms, msg, logger)
+
+	select {
+	case payload := <-webhookCh:
+		if payload.MessageID != "test-msg-001" {
+			t.Errorf("expected messageId=test-msg-001, got %q", payload.MessageID)
+		}
+		if payload.Content != "hello router" {
+			t.Errorf("expected content=hello router, got %q", payload.Content)
+		}
+		if payload.MediaType != "" {
+			t.Errorf("expected empty mediaType for text-only message, got %q", payload.MediaType)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for webhook call")
+	}
+}
+
 // queryCallResult returns the (result, duration_sec, reason) for a call row,
 // or empties if no row exists.
 func queryCallResult(ms *MessageStore, callID, chatJID string) (result string, duration sql.NullInt64, reason sql.NullString, found bool) {

@@ -65,7 +65,7 @@ func sendWebhookPayload(payload WebhookPayload) {
 }
 
 // SendWebhook sends a text-only message to the webhook endpoint.
-func SendWebhook(sender, content, chatJID string, isFromMe bool, quotedMessageId, quotedSender, quotedContent string) {
+func SendWebhook(sender, content, chatJID string, isFromMe bool, quotedMessageId, quotedSender, quotedContent, messageID string) {
 	sendWebhookPayload(WebhookPayload{
 		Sender:          sender,
 		Content:         content,
@@ -74,6 +74,7 @@ func SendWebhook(sender, content, chatJID string, isFromMe bool, quotedMessageId
 		QuotedMessageId: quotedMessageId,
 		QuotedSender:    quotedSender,
 		QuotedContent:   quotedContent,
+		MessageID:       messageID,
 	})
 }
 
