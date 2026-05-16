@@ -1594,6 +1594,76 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 	})
 
+	// Handler for sending a message reaction (emoji ack). Uses whatsmeow's
+	// BuildReaction; sender is looked up from messages.db so callers only
+	// need to supply chat_id + message_id + emoji.
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatID    string `json:"chat_id"`
+			MessageID string `json:"message_id"`
+			Emoji     string `json:"emoji"`
+			Sender    string `json:"sender,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if req.ChatID == "" || req.MessageID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "chat_id and message_id required"})
+			return
+		}
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "not connected to WhatsApp"})
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("bad chat_id: %v", err)})
+			return
+		}
+		var senderJID types.JID
+		if req.Sender != "" {
+			senderJID, err = types.ParseJID(req.Sender)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("bad sender: %v", err)})
+				return
+			}
+		} else if chatJID.Server == "s.whatsapp.net" || chatJID.Server == "lid" {
+			senderJID = chatJID
+		} else {
+			// Group message — look up sender_jid in messages.db
+			var senderStr string
+			row := messageStore.db.QueryRow("SELECT sender FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1", req.MessageID, req.ChatID)
+			if scanErr := row.Scan(&senderStr); scanErr != nil || senderStr == "" {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "message not found in store; pass sender explicitly"})
+				return
+			}
+			senderJID, err = types.ParseJID(senderStr)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("bad stored sender %q: %v", senderStr, err)})
+				return
+			}
+		}
+		reactionMsg := client.BuildReaction(chatJID, senderJID, types.MessageID(req.MessageID), req.Emoji)
+		if _, sendErr := client.SendMessage(context.Background(), chatJID, reactionMsg); sendErr != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("send failed: %v", sendErr)})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "reacted"})
+	})
+
 	// Start the server with proper timeouts. Bind to loopback so the bridge is
 	// not reachable from the LAN; MCP clients talk to it over localhost.
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
