@@ -1640,7 +1640,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		} else if chatJID.Server == "s.whatsapp.net" || chatJID.Server == "lid" {
 			senderJID = chatJID
 		} else {
-			// Group message — look up sender_jid in messages.db
+			// Group message — look up sender phone in messages.db (bridge stores it bare, post-LID
+			// migration). For reaction targeting we need the original sender's LID, not their phone.
 			var senderStr string
 			row := messageStore.db.QueryRow("SELECT sender FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1", req.MessageID, req.ChatID)
 			if scanErr := row.Scan(&senderStr); scanErr != nil || senderStr == "" {
@@ -1648,11 +1649,25 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "message not found in store; pass sender explicitly"})
 				return
 			}
-			senderJID, err = types.ParseJID(senderStr)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("bad stored sender %q: %v", senderStr, err)})
-				return
+			// Hydrate to a JID. messages.db stores either a bare phone number (post-LID migration)
+			// or already-qualified `user@server`.
+			if strings.Contains(senderStr, "@") {
+				senderJID, err = types.ParseJID(senderStr)
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("bad stored sender %q: %v", senderStr, err)})
+					return
+				}
+			} else {
+				senderJID = types.JID{User: senderStr, Server: types.DefaultUserServer}
+			}
+			// Resolve PN -> LID; WhatsApp groups address reactions by LID even when messages.db
+			// stores phones. Without this the reaction transmits but doesn't render.
+			if senderJID.Server == types.DefaultUserServer && client.Store != nil && client.Store.LIDs != nil {
+				ctx := context.Background()
+				if lid, lerr := client.Store.LIDs.GetLIDForPN(ctx, senderJID); lerr == nil && !lid.IsEmpty() {
+					senderJID = lid
+				}
 			}
 		}
 		reactionMsg := client.BuildReaction(chatJID, senderJID, types.MessageID(req.MessageID), req.Emoji)
