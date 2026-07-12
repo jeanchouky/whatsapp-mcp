@@ -1092,63 +1092,66 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store message: %v", err)
 	}
 
-	// For image messages, download media synchronously so we can include the base64
-	// payload in the webhook. Other media types (video, audio, document) are still
-	// downloaded asynchronously since they are not passed to the AI vision pipeline.
-	var imageDownloadPath string
-	var imageMimeType string
-	if mediaType == "image" && url != "" && len(mediaKey) > 0 {
-		logger.Infof("Downloading image media for message %s (synchronous)", msg.Info.ID)
-		success, _, _, dlPath, dlErr := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
-		if success && dlErr == nil {
-			imageDownloadPath = dlPath
-			// Detect MIME type by sniffing the actual file bytes rather than
-			// trusting the generated filename extension (always .jpg).
-			if f, openErr := os.Open(dlPath); openErr == nil {
-				buf := make([]byte, 512)
-				if n, readErr := f.Read(buf); readErr == nil || n > 0 {
-					imageMimeType = http.DetectContentType(buf[:n])
+	// Download media synchronously so the webhook can carry the bytes (base64).
+	// Images are always fetched (vision pipeline); documents/video/audio are now
+	// fetched too — previously they were forwarded text-only and caption-less ones
+	// were dropped entirely. Files larger than the webhook's base64 cap are NOT
+	// fetched synchronously (they can't be inlined anyway and a large download would
+	// stall the bridge event loop): they're cached asynchronously and the router
+	// refetches via /api/download, while the webhook still carries mediaType so
+	// nothing is lost.
+	var mediaDownloadPath string
+	var mediaMimeType string
+	if mediaType != "" && url != "" && len(mediaKey) > 0 {
+		if mediaType == "image" || fileLength == 0 || fileLength <= maxMediaBase64Bytes {
+			logger.Infof("Downloading %s media for message %s (synchronous)", mediaType, msg.Info.ID)
+			success, _, _, dlPath, dlErr := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+			if success && dlErr == nil {
+				mediaDownloadPath = dlPath
+				// Detect MIME type by sniffing the actual file bytes rather than
+				// trusting the generated filename extension.
+				if f, openErr := os.Open(dlPath); openErr == nil {
+					buf := make([]byte, 512)
+					if n, readErr := f.Read(buf); readErr == nil || n > 0 {
+						mediaMimeType = http.DetectContentType(buf[:n])
+					}
+					_ = f.Close()
 				}
-				_ = f.Close()
+				if mediaMimeType == "" {
+					mediaMimeType = "application/octet-stream"
+				}
+				logger.Infof("✅ %s downloaded: %s (%s)", mediaType, dlPath, mediaMimeType)
+			} else {
+				logger.Warnf("❌ %s download failed: %v", mediaType, dlErr)
+				// Cache asynchronously so a later MCP/router fetch can find it.
+				go func() {
+					_, _, _, _, _ = downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+				}()
 			}
-			if imageMimeType == "" {
-				imageMimeType = "application/octet-stream"
-			}
-			logger.Infof("✅ Image downloaded: %s (%s)", dlPath, imageMimeType)
 		} else {
-			logger.Warnf("❌ Image download failed: %v", dlErr)
-			// Fall back to async download so media is cached for future MCP tool calls
+			// Too large to inline: don't block the event loop. Cache async; the
+			// webhook still carries mediaType so the router fetches via /api/download.
+			logger.Infof("Auto-downloading large %s media for message %s (async, %d bytes)", mediaType, msg.Info.ID, fileLength)
 			go func() {
 				_, _, _, _, _ = downloadMedia(client, messageStore, msg.Info.ID, chatJID)
 			}()
 		}
-	} else if mediaType != "" && mediaType != "image" && url != "" && len(mediaKey) > 0 {
-		// Non-image media: async download for caching only (not sent to vision pipeline)
-		logger.Infof("Auto-downloading %s media for message %s", mediaType, msg.Info.ID)
-		go func() {
-			success, _, _, downloadPath, err := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
-			if success && err == nil {
-				logger.Infof("✅ Auto-downloaded media: %s", downloadPath)
-			} else {
-				logger.Warnf("❌ Auto-download failed: %v", err)
-			}
-		}()
 	}
 
-	// Send webhook for incoming messages.
-	// Forward self-messages when FORWARD_SELF=true.
-	// Always forward image messages (even without a text caption) so the AI vision
-	// pipeline can analyse the image content.
+	// Send webhook for incoming messages. Forward self-messages when FORWARD_SELF=true.
+	// Forward ALL media (even without a text caption) so the AI can ingest it: route
+	// media through SendWebhookWithMedia so the payload carries mediaType/mimeType/
+	// filename (+ base64 when available). Text-only messages use the plain webhook.
 	shouldForward := forwardSelfMessages || !msg.Info.IsFromMe
 	hasText := content != ""
-	hasImage := mediaType == "image"
+	hasMedia := mediaType != ""
 
-	if shouldForward && (hasText || hasImage) {
-		if hasImage {
+	if shouldForward && (hasText || hasMedia) {
+		if hasMedia {
 			SendWebhookWithMedia(
 				sender, content, chatJID, msg.Info.IsFromMe,
 				quotedMessageId, quotedSender, quotedContent,
-				msg.Info.ID, mediaType, imageMimeType, filename, imageDownloadPath,
+				msg.Info.ID, mediaType, mediaMimeType, filename, mediaDownloadPath,
 			)
 		} else {
 			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, msg.Info.ID)
@@ -1355,8 +1358,24 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
+	// Download the media. whatsmeow's normal Download() rebuilds the request URL from
+	// directPath + media_conn host and DROPS the signed oh/oe query params that
+	// WhatsApp's CDN now requires (whatsmeow #1174, closed "not planned") → HTTP 403
+	// on every download. When the stored URL still carries the signed params, bypass
+	// the rebuild and fetch straight from the full URL via DangerousInternals; fall
+	// back to the directPath downloader for older media whose URL lacks them.
+	var mediaData []byte
+	if strings.Contains(url, "oh=") {
+		mediaData, err = client.DangerousInternals().DownloadAndDecrypt(
+			context.Background(), url, mediaKey, waMediaType, fileEncSHA256, fileSHA256,
+		)
+		if err != nil {
+			fmt.Printf("Full-URL download failed (%v); falling back to directPath downloader\n", err)
+			mediaData, err = client.Download(context.Background(), downloader)
+		}
+	} else {
+		mediaData, err = client.Download(context.Background(), downloader)
+	}
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}

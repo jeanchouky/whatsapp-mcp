@@ -919,6 +919,73 @@ func TestHandleMessage_ImageWithCaption_WebhookForwarded(t *testing.T) {
 	}
 }
 
+// buildDocumentMessage builds an incoming document message, optionally with a
+// filename and a text caption.
+func buildDocumentMessage(chat, sender types.JID, isFromMe bool, fileName, caption string) *events.Message {
+	doc := &waProto.DocumentMessage{}
+	if fileName != "" {
+		doc.FileName = proto.String(fileName)
+	}
+	if caption != "" {
+		doc.Caption = proto.String(caption)
+	}
+	return &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chat,
+				Sender:   sender,
+				IsFromMe: isFromMe,
+			},
+			ID:        "test-doc-001",
+			Timestamp: time.Now(),
+		},
+		Message: &waProto.Message{DocumentMessage: doc},
+	}
+}
+
+// TestHandleMessage_DocumentOnly_WebhookForwarded is the regression test for the
+// media-403 fix (whatsmeow #1174). A caption-less document used to be dropped at
+// the bridge (forwarded only when hasText||hasImage) and even a captioned document
+// was sent text-only via SendWebhook with no mediaType. Documents must now be
+// forwarded via SendWebhookWithMedia carrying mediaType="document" + the filename,
+// so the router can fetch/flag the attachment instead of silently losing it.
+func TestHandleMessage_DocumentOnly_WebhookForwarded(t *testing.T) {
+	srv, webhookCh := captureWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	msg := buildDocumentMessage(phonePN, phonePN, false, "invoice.pdf", "") // no caption
+
+	handleMessage(client, ms, msg, logger)
+
+	// The caption-less document must be stored.
+	if count := queryMessageCount(ms, phonePN.String()); count != 1 {
+		t.Errorf("expected 1 message stored, got %d", count)
+	}
+
+	// The webhook must have been called with the document media metadata.
+	select {
+	case payload := <-webhookCh:
+		if payload.MediaType != "document" {
+			t.Errorf("expected mediaType=document, got %q", payload.MediaType)
+		}
+		if payload.MediaFilename != "invoice.pdf" {
+			t.Errorf("expected mediaFilename=invoice.pdf, got %q", payload.MediaFilename)
+		}
+		if payload.MessageID != "test-doc-001" {
+			t.Errorf("expected messageId=test-doc-001, got %q", payload.MessageID)
+		}
+		if payload.Content != "" {
+			t.Errorf("expected empty content for caption-less document, got %q", payload.Content)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for webhook call")
+	}
+}
+
 // TestHandleMessage_TextOnly_WebhookIncludesMessageID is the regression test for
 // the bug where the text-only webhook path dropped messageId: downstream routers
 // dedup on message_id and need a stable identifier for every message, not just media.
