@@ -85,7 +85,10 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	// busy_timeout + WAL: event-handler goroutines and HTTP handlers share this
+	// DB; without them a history-sync write racing a read returns SQLITE_BUSY
+	// and the store call is only logged, silently dropping rows (2026-07-24 audit).
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -1166,11 +1169,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			direction = "→"
 		}
 
-		// Log based on message type
+		// Log shape only — sender JIDs and message bodies stay out of the
+		// journal (PII-at-rest; 2026-07-24 audit). Content lives in messages.db.
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s msg (media=%s chars=%d)\n", timestamp, direction, mediaType, len(content))
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s msg (chars=%d)\n", timestamp, direction, len(content))
 		}
 	}
 }
@@ -1452,7 +1456,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		// Log shape only — message bodies and paths stay out of the journal
+		// (PII-at-rest; 2026-07-24 audit).
+		fmt.Printf("Received send request (chars=%d, media=%t)\n", len(req.Message), req.MediaPath != "")
 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
@@ -1714,7 +1720,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Run server in a goroutine so it doesn't block
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Printf("REST API server error: %v\n", err)
+			// A dead REST API with a live WhatsApp link is worse than a restart:
+			// systemd sees "healthy" while every send/download fails (e.g. port
+			// squatted by a stale instance). Exit non-zero so Restart=on-failure
+			// brings up a working instance (2026-07-24 audit).
+			fmt.Printf("REST API server error: %v — exiting for systemd restart\n", err)
+			os.Exit(1)
 		}
 	}()
 }
@@ -1723,7 +1734,7 @@ func main() {
 	flag.Parse()
 
 	// Set up logger with DEBUG level for more detailed logging
-	logger := waLog.Stdout("Client", "DEBUG", true)
+	logger := waLog.Stdout("Client", "INFO", true) // INFO: DEBUG dumps message plaintext+JIDs into journald (2026-07-24 audit)
 	logger.Infof("Starting WhatsApp client...")
 
 	if forwardSelfMessages {
