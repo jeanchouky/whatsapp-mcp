@@ -97,7 +97,10 @@ func (a *apiAuth) check(w http.ResponseWriter, r *http.Request, recipient string
 		http.Error(w, "api auth is configured but no token can be read", http.StatusServiceUnavailable)
 		return false
 	}
-	presented := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
+	presented := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		presented = ""
+	}
 	var found *apiToken
 	for i := range tokens {
 		if subtle.ConstantTimeCompare([]byte(tokens[i].token), []byte(presented)) == 1 {
@@ -114,6 +117,24 @@ func (a *apiAuth) check(w http.ResponseWriter, r *http.Request, recipient string
 		return false
 	}
 	return true
+}
+
+// unscoped: the presented token has scope "*" (or auth is off). A scoped token never gets the bridge to read a
+// file from disk on its behalf (the bridge runs as the house user; the agents do not).
+func (a *apiAuth) unscoped(r *http.Request) bool {
+	if a == nil {
+		return true
+	}
+	a.mu.Lock()
+	tokens := a.tokens
+	a.mu.Unlock()
+	presented := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	for i := range tokens {
+		if subtle.ConstantTimeCompare([]byte(tokens[i].token), []byte(presented)) == 1 && tokens[i].scope == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // apiAuthFromEnv: WHATSAPP_API_TOKENS_FILE, or nil (open API, as upstream).

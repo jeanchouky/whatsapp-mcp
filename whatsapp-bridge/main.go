@@ -1448,6 +1448,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if !auth.check(w, r, req.Recipient) {
 			return
 		}
+		if req.MediaPath != "" && !auth.unscoped(r) {
+			http.Error(w, "a scoped token may not attach files", http.StatusForbidden)
+			return
+		}
 
 		// Validate request
 		if req.Recipient == "" {
@@ -1489,9 +1493,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if !auth.check(w, r, "") {
-			return
-		}
 
 		// Check if connected
 		if !client.IsConnected() {
@@ -1512,6 +1513,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Validate request
+		if !auth.check(w, r, req.ChatJID) { // a scoped token downloads from its own chats only
+			return
+		}
 		if req.MessageID == "" || req.ChatJID == "" {
 			http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
 			return
