@@ -1415,6 +1415,7 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	auth := apiAuthFromEnv() // nil = open (upstream); see auth.go
 	// Health check endpoint
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1442,6 +1443,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if !auth.check(w, r, req.Recipient) {
 			return
 		}
 
@@ -1483,6 +1487,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !auth.check(w, r, "") {
 			return
 		}
 
@@ -1560,6 +1567,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
+		if !auth.check(w, r, req.Recipient) {
+			return
+		}
 
 		// Validate request
 		if req.Recipient == "" {
@@ -1635,6 +1645,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if !auth.check(w, r, req.ChatID) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

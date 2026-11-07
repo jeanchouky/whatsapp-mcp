@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -50,7 +51,16 @@ func sendWebhookPayload(payload WebhookPayload) {
 		return
 	}
 
-	resp, err := webhookClient.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		fmt.Printf("Error building webhook request: %v\n", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if tok := strings.TrimSpace(os.Getenv("WEBHOOK_TOKEN")); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok) // the receiver can tell the bridge from any local process
+	}
+	resp, err := webhookClient.Do(req)
 	if err != nil {
 		fmt.Printf("Error sending webhook: %v\n", err)
 		return
