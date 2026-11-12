@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -14,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -667,6 +669,43 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// Inline attachment: the caller reads the file under its own uid and sends the bytes, so the bridge never
+	// opens a path a scoped token chose. MediaName supplies the extension (type) and the document title.
+	MediaB64  string `json:"media_b64,omitempty"`
+	MediaName string `json:"media_name,omitempty"`
+}
+
+const maxSendBody = 72 << 20 // ~54 MB of file once base64 is decoded; WhatsApp's own document cap is higher, photos far lower
+
+var mediaNameUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// inlineMediaFile writes base64 media to a fresh 0700 temp dir the bridge owns; the caller removes the dir.
+func inlineMediaFile(b64, name string) (string, string, error) {
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", "", fmt.Errorf("media_b64 is not valid base64")
+	}
+	if len(data) == 0 {
+		return "", "", fmt.Errorf("media_b64 is empty")
+	}
+	base := mediaNameUnsafe.ReplaceAllString(filepath.Base(name), "_")
+	base = strings.TrimLeft(base, ".")
+	if base == "" || !strings.Contains(base, ".") {
+		return "", "", fmt.Errorf("media_name must be a file name with an extension")
+	}
+	if len(base) > 120 {
+		base = base[len(base)-120:]
+	}
+	dir, err := os.MkdirTemp("", "jc-bridge-media-")
+	if err != nil {
+		return "", "", err
+	}
+	path := filepath.Join(dir, base)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		os.RemoveAll(dir)
+		return "", "", err
+	}
+	return path, dir, nil
 }
 
 // Function to send a WhatsApp message
@@ -1440,17 +1479,31 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Parse the request body
+		r.Body = http.MaxBytesReader(w, r.Body, maxSendBody)
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			http.Error(w, "Invalid request format (or body over the size cap)", http.StatusBadRequest)
 			return
 		}
 		if !auth.check(w, r, req.Recipient) {
 			return
 		}
 		if req.MediaPath != "" && !auth.unscoped(r) {
-			http.Error(w, "a scoped token may not attach files", http.StatusForbidden)
+			http.Error(w, "a scoped token may not attach files by path; send media_b64 + media_name", http.StatusForbidden)
 			return
+		}
+		if req.MediaB64 != "" {
+			if req.MediaPath != "" {
+				http.Error(w, "send media_path or media_b64, not both", http.StatusBadRequest)
+				return
+			}
+			p, dir, err := inlineMediaFile(req.MediaB64, req.MediaName)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer os.RemoveAll(dir)
+			req.MediaPath, req.MediaB64 = p, ""
 		}
 
 		// Validate request
